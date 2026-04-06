@@ -77,4 +77,13 @@ if [ -n "$DB_HOST" ]; then
   fi
 fi
 
+# Auto-install all modules from this repo (list generated at build time)
+if [ -f /modules.txt ]; then
+  MODULES=$(cat /modules.txt | tr -s ' ' | xargs)
+  if [ -n "$MODULES" ]; then
+    echo ">>> Auto-installing repo modules: $MODULES"
+    exec "$@" -i "$MODULES"
+  fi
+fi
+
 exec "$@"

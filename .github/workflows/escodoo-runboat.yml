@@ -1,0 +1,430 @@
+name: Escodoo Review Apps
+
+on:
+  pull_request_target:
+    branches:
+      - "*"
+    types: [opened, synchronize, reopened, closed]
+  push:
+    branches:
+      - "16.0"
+      - "16.0-ocabot-*"
+  issue_comment:
+    types: [created]
+
+concurrency:
+  group: review-${{ github.head_ref || github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  review-app:
+    runs-on: ubuntu-latest
+    if: |
+      (github.event_name == 'pull_request' && github.event.action == 'opened') ||
+      (github.event_name == 'pull_request' && (github.event.action == 'closed' || github.event.action == 'merged')) ||
+      (github.event_name == 'issue_comment' && contains(github.event.comment.body, '/escodoo-start') && github.event.issue.pull_request) ||
+      (github.event_name == 'issue_comment' && contains(github.event.comment.body, '/escodoo-stop') && github.event.issue.pull_request) ||
+      (github.event_name == 'issue_comment' && contains(github.event.comment.body, '/escodoo-reset') && github.event.issue.pull_request) ||
+      (github.event_name == 'issue_comment' && contains(github.event.comment.body, '/escodoo-status') && github.event.issue.pull_request) ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/16.0')
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ─── Parse command from PR comment ────────────────────────────────────
+      - name: Parse command
+        id: parse
+        run: |
+          ACTION=""
+          PR_NUMBER=""
+
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            PR_NUMBER="${{ github.event.pull_request.number }}"
+            if [ "${{ github.event.action }}" = "opened" ]; then
+              ACTION="start"
+              echo "Event: PR opened, auto-starting deploy"
+            elif [ "${{ github.event.action }}" = "closed" ] || [ "${{ github.event.action }}" = "merged" ]; then
+              ACTION="stop"
+              echo "Event: PR closed/merged, suspending instance"
+            fi
+          elif [ "${{ github.event_name }}" = "push" ]; then
+            echo "Event: push to 16.0, starting deploy"
+            ACTION="start"
+          elif [ "${{ github.event_name }}" = "issue_comment" ]; then
+            PR_NUMBER="${{ github.event.issue.number }}"
+            ACTION=$(echo "${{ github.event.comment.body }}" | grep -oiP '(?<=/escodoo-)(start|stop|reset|status)' | head -1 | tr '[:upper:]' '[:lower:]')
+            if [ -z "$ACTION" ]; then
+              echo "No valid /escodoo-{start|stop|reset|status} command found in comment, skipping."
+              echo "skip=true" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+            echo "Detected: /escodoo-$ACTION"
+          fi
+
+          echo "action=$ACTION" >> $GITHUB_OUTPUT
+          echo "pr_number=$PR_NUMBER" >> $GITHUB_OUTPUT
+          echo "skip=false" >> $GITHUB_OUTPUT
+
+          # Grab branch/commit info
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "branch=${{ github.event.pull_request.head.ref }}" >> $GITHUB_OUTPUT
+            echo "sha=${{ github.event.pull_request.head.sha }}" >> $GITHUB_OUTPUT
+          else
+            echo "branch=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+            echo "sha=${{ github.sha }}" >> $GITHUB_OUTPUT
+          fi
+
+      # ─── Acknowledge command ─────────────────────────────────────────────
+      - name: Acknowledge command
+        if: steps.parse.outputs.skip != 'true' && steps.parse.outputs.action != ''
+        uses: actions/github-script@v7
+        env:
+          ACTION: ${{ steps.parse.outputs.action }}
+          PR_NUMBER: ${{ steps.parse.outputs.pr_number }}
+          AUTHOR: ${{ github.event.comment.user.login }}
+          BRANCH: ${{ steps.parse.outputs.branch }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const action = process.env.ACTION;
+            const pr = parseInt(process.env.PR_NUMBER);
+            const author = process.env.AUTHOR;
+            const branch = process.env.BRANCH;
+
+            if (!pr) {
+              // No PR associated (e.g. direct push), skip comment
+              return;
+            }
+
+            const labels = { start: '▶', stop: '⏸', reset: '⟳', status: '◉' };
+            const verbs = { start: 'Starting', stop: 'Stopping', reset: 'Resetting', status: 'Checking' };
+
+            const reactMsg = `${labels[action] || '🔧'} **@${author || 'trigger'}** — ${verbs[action] || 'Processing'} review app… (branch: \`${branch}\`)`;
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: pr,
+              body: reactMsg,
+            });
+
+      # ─── STOP: Suspend review app instance ────────────────────────────────
+      - name: Suspend review app instance
+        if: steps.parse.outputs.action == 'stop'
+        run: |
+          if [ -z "${{ secrets.RENDER_SERVICE_ID }}" ]; then
+            echo "RENDER_SERVICE_ID not configured — skipping."
+            exit 0
+          fi
+
+          HTTP_CODE=$(curl -sf -o /dev/null -w "%{http_code}" -X POST \
+            "https://api.render.com/v1/services/${{ secrets.RENDER_SERVICE_ID }}/suspend" \
+            -H "Authorization: Bearer ${{ secrets.RENDER_API_KEY }}" \
+            -H "Content-Type: application/json" || true)
+
+          echo "Suspend response code: $HTTP_CODE"
+          if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "204" ]; then
+            echo "Render service suspended successfully."
+          else
+            echo "Suspend may have failed (code $HTTP_CODE). Check Render dashboard."
+          fi
+
+      - name: Update PR comment — stopped
+        if: steps.parse.outputs.action == 'stop'
+        uses: actions/github-script@v7
+        env:
+          PR_NUMBER: ${{ steps.parse.outputs.pr_number }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const pr = parseInt(process.env.PR_NUMBER);
+            if (!pr) return;
+
+            const body =
+              `### Escodoo Review App\n` +
+              `- **Status:** Stopped\n` +
+              `- **Instance:** suspended\n\n` +
+              `> Comment \`/escodoo-start\` to wake it up.\n`;
+
+            await upsertComment(github, context, pr, body);
+
+            async function upsertComment(gh, ctx, prNum, body) {
+              const { data: comments } = await gh.rest.issues.listComments({
+                owner: ctx.repo.owner, repo: ctx.repo.repo, issue_number: prNum, per_page: 100,
+              });
+              const existing = comments.find(c => c.user.type === 'Bot' && c.body.startsWith('### Escodoo Review App'));
+              if (existing) {
+                await gh.rest.issues.updateComment({ owner: ctx.repo.owner, repo: ctx.repo.repo, comment_id: existing.id, body });
+              } else {
+                await gh.rest.issues.createComment({ owner: ctx.repo.owner, repo: ctx.repo.repo, issue_number: prNum, body });
+              }
+            }
+
+      # ─── START / RESET: Deploy review app on Render ──────────────────────
+      - name: Trigger Render deploy
+        if: steps.parse.outputs.action == 'start' || steps.parse.outputs.action == 'reset'
+        id: trigger
+        run: |
+          set -e
+          if [ -z "${{ secrets.RENDER_SERVICE_ID }}" ]; then
+            echo "RENDER_SERVICE_ID not configured — skipping deploy."
+            exit 1
+          fi
+
+          CLEAR_CACHE="do_not_clear"
+          if [ "${{ steps.parse.outputs.action }}" = "reset" ]; then
+            CLEAR_CACHE="clear"
+            echo "Reset mode: clearing cache"
+          fi
+
+          DEPLOY_JSON=$(curl -sf -X POST \
+            "https://api.render.com/v1/services/${{ secrets.RENDER_SERVICE_ID }}/deploys" \
+            -H "Authorization: Bearer ${{ secrets.RENDER_API_KEY }}" \
+            -H "Content-Type: application/json" \
+            -d "{\"clearCache\": \"$CLEAR_CACHE\"}")
+
+          DEPLOY_ID=$(echo "$DEPLOY_JSON" | python3 -c "
+            import sys, json
+            data = json.load(sys.stdin)
+            d = data.get('deploy', data)
+            print(d.get('id', ''))" 2>/dev/null || echo "")
+
+          echo "deploy_id=$DEPLOY_ID" >> $GITHUB_OUTPUT
+          echo "Deploy triggered (id: ${DEPLOY_ID:-pending})"
+
+      # ─── Wait for deploy completion & stream logs ─────────────────────────
+      - name: Wait for deploy & stream logs
+        if: steps.parse.outputs.action == 'start' || steps.parse.outputs.action == 'reset'
+        run: |
+          set -e
+          DEPLOY_ID="${{ steps.trigger.outputs.deploy_id }}"
+          SERVICE_ID="${{ secrets.RENDER_SERVICE_ID }}"
+          API_KEY="${{ secrets.RENDER_API_KEY }}"
+          URL="https://account-addons-runboat.onrender.com"
+
+          if [ -z "$DEPLOY_ID" ]; then
+            echo "No deploy ID available — skipping status poll."
+            echo "deploy_status=unknown" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "🔄 Polling deploy status for $DEPLOY_ID ..."
+          echo ""
+
+          LAST_LOG_LINE=0
+          MAX_WAIT=600  # 10 minutes max
+          ELAPSED=0
+          INTERVAL=10   # poll every 10s
+
+          while true; do
+            # Get deploy status
+            DEPLOY_INFO=$(curl -sf \
+              "https://api.render.com/v1/services/$SERVICE_ID/deploys/$DEPLOY_ID" \
+              -H "Authorization: Bearer $API_KEY" 2>/dev/null || echo "{}")
+
+            STATUS=$(echo "$DEPLOY_INFO" | python3 -c "
+              import sys, json
+              data = json.load(sys.stdin)
+              print(data.get('status', 'unknown'))
+            " 2>/dev/null || echo "unknown")
+
+            echo "[$(date -u +%H:%M:%S)] Deploy status: $STATUS (waited ${ELAPSED}s)"
+
+            # Try to stream new log lines
+            LOG_LINES=$(curl -sf \
+              "https://api.render.com/v1/services/$SERVICE_ID/deploys/$DEPLOY_ID/logs" \
+              -H "Authorization: Bearer $API_KEY" 2>/dev/null || echo "[]")
+
+            TOTAL_LINES=$(echo "$LOG_LINES" | python3 -c "
+              import sys, json
+              try:
+                  lines = json.load(sys.stdin)
+                  print(len(lines))
+              except:
+                  print(0)
+            " 2>/dev/null || echo "0")
+
+            if [ "$TOTAL_LINES" -gt "$LAST_LOG_LINE" ] 2>/dev/null; then
+              echo "$LOG_LINES" | python3 -c "
+              import sys, json
+              try:
+                  lines = json.load(sys.stdin)
+                  for line in lines[$LAST_LOG_LINE:]:
+                      ts = line.get('at', '')
+                      msg = line.get('line', '')
+                      print(f'  [LOG {ts}] {msg}')
+              except:
+                  pass
+              " 2>/dev/null || true
+              LAST_LOG_LINE=$TOTAL_LINES
+            fi
+
+            if [ "$STATUS" = "live" ] || [ "$STATUS" = "succeeded" ]; then
+              echo ""
+              echo "✅ Deploy completed successfully!"
+              echo "🌐 Instance available at: $URL"
+              echo "deploy_status=success" >> $GITHUB_OUTPUT
+              break
+            elif [ "$STATUS" = "build_failed" ] || [ "$STATUS" = "deactivated" ] || [ "$STATUS" = "canceled" ]; then
+              echo ""
+              echo "❌ Deploy failed with status: $STATUS"
+              echo "deploy_status=$STATUS" >> $GITHUB_OUTPUT
+              exit 1
+            fi
+
+            ELAPSED=$((ELAPSED + INTERVAL))
+            if [ $ELAPSED -ge $MAX_WAIT ]; then
+              echo ""
+              echo "⏱ Timeout after ${MAX_WAIT}s — deploy still in progress ($STATUS)."
+              echo "Check Render dashboard for details."
+              echo "deploy_status=timeout" >> $GITHUB_OUTPUT
+              exit 1
+            fi
+
+            sleep $INTERVAL
+          done
+
+      # ─── Check review app service state ───────────────────────────────────
+      - name: Get Render service status
+        if: steps.parse.outputs.action == 'status'
+        id: svc_status
+        run: |
+          if [ -z "${{ secrets.RENDER_SERVICE_ID }}" ]; then
+            echo "RENDER_SERVICE_ID not configured."
+            exit 0
+          fi
+
+          SVC_JSON=$(curl -sf \
+            "https://api.render.com/v1/services/${{ secrets.RENDER_SERVICE_ID }}" \
+            -H "Authorization: Bearer ${{ secrets.RENDER_API_KEY }}")
+
+          SVC_URL=$(echo "$SVC_JSON" | python3 -c "
+            import sys, json
+            data = json.load(sys.stdin)
+            print(data.get('service', data).get('serviceDetails', {}).get('url', 'unknown'))" 2>/dev/null || echo "unknown")
+
+          LAST_DEPLOY=$(echo "$SVC_JSON" | python3 -c "
+            import sys, json
+            data = json.load(sys.stdin)
+            d = data.get('service', data).get('lastDeploy', {})
+            if d:
+              print(f\"{d.get('status', 'unknown')} — {d.get('finishedAt', d.get('createdAt', 'unknown'))}\")
+            else:
+              print('No deployment info')
+          " 2>/dev/null || echo "unknown")
+
+          echo "url=$SVC_URL" >> $GITHUB_OUTPUT
+          echo "last_deploy=$LAST_DEPLOY" >> $GITHUB_OUTPUT
+          echo "Service URL: $SVC_URL"
+          echo "Last deploy: $LAST_DEPLOY"
+
+      # ─── Update PR comment with final status ──────────────────────────────
+      - name: Update PR comment — final status
+        if: always() && steps.parse.outputs.skip != 'true'
+        uses: actions/github-script@v7
+        env:
+          PR_NUMBER: ${{ steps.parse.outputs.pr_number }}
+          ACTION: ${{ steps.parse.outputs.action }}
+          BRANCH: ${{ steps.parse.outputs.branch }}
+          SHA: ${{ steps.parse.outputs.sha }}
+          SVC_URL: ${{ steps.svc_status.outputs.url || 'https://account-addons-runboat.onrender.com' }}
+          LAST_DEPLOY: ${{ steps.svc_status.outputs.last_deploy || '' }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const pr = parseInt(process.env.PR_NUMBER);
+            const action = process.env.ACTION;
+            const branch = process.env.BRANCH;
+            const sha = process.env.SHA ? process.env.SHA.substring(0, 7) : '';
+            const svcUrl = process.env.SVC_URL;
+            const lastDeploy = process.env.LAST_DEPLOY;
+
+            if (!pr) return;
+
+            let statusText = '';
+            let instanceText = '';
+
+            // Read deploy status from env (set by poll step)
+            const deployStatus = process.env.DEPLOY_STATUS || '';
+            const jobStatus = process.env.JOB_STATUS;
+
+            switch (action) {
+              case 'start':
+                if (deployStatus === 'success') {
+                  statusText = 'Running';
+                  instanceText = `[${svcUrl}](${svcUrl})`;
+                } else if (deployStatus) {
+                  statusText = `Failed (${deployStatus})`;
+                  instanceText = 'error — check logs';
+                } else {
+                  statusText = 'Deploying…';
+                  instanceText = `[${svcUrl}](${svcUrl}) (building)`;
+                }
+                break;
+              case 'reset':
+                if (deployStatus === 'success') {
+                  statusText = 'Running (reset complete)';
+                  instanceText = `[${svcUrl}](${svcUrl})`;
+                } else if (deployStatus) {
+                  statusText = `Reset failed (${deployStatus})`;
+                  instanceText = 'error — check logs';
+                } else {
+                  statusText = 'Resetting…';
+                  instanceText = 'rebuilding…';
+                }
+                break;
+              case 'stop':
+                statusText = 'Stopped';
+                instanceText = 'suspended';
+                break;
+              case 'status':
+                statusText = lastDeploy ? `Running — ${lastDeploy}` : 'Running';
+                instanceText = `[${svcUrl}](${svcUrl})`;
+                break;
+              default:
+                statusText = 'Starting…';
+                instanceText = `[${svcUrl}](${svcUrl})`;
+            }
+
+            const body =
+              `### Escodoo Review App\n` +
+              `- **Status:** ${statusText}\n` +
+              `- **Instance:** ${instanceText}\n` +
+              `- **Branch:** \`${branch}\`\n` +
+              `- **Commit:** \`${sha}\`\n\n` +
+              `**Commands:**\n` +
+              `- \`/escodoo-start\` — wake up / deploy\n` +
+              `- \`/escodoo-stop\` — suspend instance\n` +
+              `- \`/escodoo-reset\` — rebuild from scratch\n` +
+              `- \`/escodoo-status\` — check current state\n\n` +
+              `> Free tier: auto-sleeps after 15 min of inactivity.\n`;
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: pr,
+              per_page: 100,
+            });
+            const existing = comments.find(c =>
+              c.user.type === 'Bot' && c.body.startsWith('### Escodoo Review App')
+            );
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: pr,
+                body,
+              });
+            }
