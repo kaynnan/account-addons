@@ -1,0 +1,13 @@
+setup/
+.git
+.github/
+.pre-commit-config.yaml
+.pylintrc
+.pylintrc-mandatory
+*.pyc
+__pycache__
+.gitignore
+render.yaml
+*.md
+!README.md
+static/description/

@@ -1,0 +1,50 @@
+services:
+  - type: web
+    name: account-addons-runboat
+    env: docker
+    dockerfilePath: Dockerfile
+    dockerContext: .
+    region: oregon
+    plan: free
+    envVars:
+      - key: HOST
+        fromDatabase:
+          name: account-addons-db
+          property: host
+      - key: USER
+        fromDatabase:
+          name: account-addons-db
+          property: user
+      - key: PASSWORD
+        fromDatabase:
+          name: account-addons-db
+          property: password
+      - key: DB_HOST
+        fromDatabase:
+          name: account-addons-db
+          property: host
+      - key: DB_PORT
+        fromDatabase:
+          name: account-addons-db
+          property: port
+      - key: DB_NAME
+        value: account_addons_runboat
+      - key: DB_USER
+        fromDatabase:
+          name: account-addons-db
+          property: user
+      - key: DB_PASSWORD
+        fromDatabase:
+          name: account-addons-db
+          property: password
+      - key: ODOO_DEFAULT_LANGUAGE
+        value: pt_BR
+      - key: ODOO_LIST_DB
+        value: "True"
+      - key: ODOO_ADMIN_PASSWD
+        generateValue: true
+    healthCheckPath: /web/health
+databases:
+  - name: account-addons-db
+    plan: free
+    region: oregon
